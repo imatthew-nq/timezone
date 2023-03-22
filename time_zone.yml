@@ -1,0 +1,32 @@
+---
+- hosts: all
+  become: no
+  gather_facts: yes
+
+  tasks:
+    - name: Display the current timestamp in YYYY-MM-DD
+      debug:
+        var: ansible_date_time.date
+
+    - name: Display the available timestamp format in Ansible
+      debug:
+        var: ansible_date_time
+
+    - name: Display hostname, current time and timezone
+      debug:
+        msg: "Hostname: {{ ansible_hostname }}, Time: {{ ansible_date_time.time }}, Timezone: {{ ansible_date_time.tz }}"
+
+    - name: Set timezone to Asia/Tehran
+      community.general.timezone:
+        name: Asia/Tehran
+      become: yes
+      when: ansible_date_time.tz != "+0330"
+
+    - name: install packages
+      apt:
+        pkg: [ 'tzdata' ]
+        state: latest
+        install_recommends: no
+        update_cache: yes
+      become: yes
+      when: ansible_date_time.tz != "+0330"
