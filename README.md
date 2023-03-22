@@ -13,3 +13,13 @@ In line which task name is:
 ```yaml
 - name: Set timezone to Asia/Tehran
 ```
+Set the timezone to your desired Geographic area/Time zone
+
+The last task upgrade package "tzdata" to the latest version from apt repository.
+Upgrade tzdata must be done specially on Ubuntu-18.04
+
+Just create your host inventory and run the playbook.
+
+```yaml
+ansible-playbook -i hosts.ini time_zone.yml
+```
