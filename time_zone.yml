@@ -1,32 +1,184 @@
 ---
-- hosts: all
-  become: no
-  gather_facts: yes
+- name: Set timezone and make sure the system clock is NTP-synchronized
+  hosts: all
+  become: false
+  gather_facts: true
+
+  vars:
+    # IANA timezone name, as listed by `timedatectl list-timezones`.
+    timezone_name: Asia/Tehran
+
+    # File on the Ansible control node that lists the NTP servers to use. Its content
+    # is appended (as an Ansible-managed block) to ntp_timesyncd_conf on every host
+    # whose clock is not synchronized. Override with: -e ntp_pools_file=/path/to/file
+    ntp_pools_file: "{{ playbook_dir }}/ntp-pools.conf"
+    ntp_timesyncd_conf: /etc/systemd/timesyncd.conf
+    # true = push the NTP config to every host, even ones that are already synchronized.
+    ntp_force: false
+    # How long to wait for the clock to sync after restarting systemd-timesyncd
+    # (ntp_sync_retries x ntp_sync_delay seconds).
+    ntp_sync_retries: 12
+    ntp_sync_delay: 5
+    # "System clock synchronized: yes" (systemd >= 236) or "NTP synchronized: yes" (older).
+    ntp_synced_regex: '^\s*(System clock|NTP) synchronized:\s*yes\s*$'
+    ntp_file_section_regex: '^\[Time\]\s*$'
+    ntp_file_servers_regex: '^NTP=\S'
 
   tasks:
-    - name: Display the current timestamp in YYYY-MM-DD
-      debug:
+    # ------------------------------------------------------------- Timezone ---
+    - name: Timezone | Display the current date (YYYY-MM-DD)
+      ansible.builtin.debug:
         var: ansible_date_time.date
+      tags: [timezone]
 
-    - name: Display the available timestamp format in Ansible
-      debug:
+    - name: Timezone | Display all available timestamp formats
+      ansible.builtin.debug:
         var: ansible_date_time
+      tags: [timezone]
 
-    - name: Display hostname, current time and timezone
-      debug:
+    - name: Timezone | Display hostname, current time and timezone
+      ansible.builtin.debug:
         msg: "Hostname: {{ ansible_hostname }}, Time: {{ ansible_date_time.time }}, Timezone: {{ ansible_date_time.tz }}"
+      tags: [timezone]
 
-    - name: Set timezone to Asia/Tehran
+    # Must run before setting the timezone: the zone has to exist in tzdata, and stale
+    # tzdata gives wrong offsets (e.g. Asia/Tehran still applying DST, abolished in 2022).
+    # "latest" is intentional: timezone rules change, and tzdata comes from the
+    # signed distro repository. cache_valid_time avoids an apt update on every run.
+    - name: Timezone | Ensure tzdata is up to date
+      ansible.builtin.apt:
+        name: tzdata
+        state: latest # noqa: package-latest
+        install_recommends: false
+        update_cache: true
+        cache_valid_time: 3600
+      become: true
+      tags: [timezone]
+
+    # Idempotent: only changes hosts whose timezone differs from timezone_name.
+    - name: Timezone | Set timezone to {{ timezone_name }}
       community.general.timezone:
-        name: Asia/Tehran
-      become: yes
-      when: ansible_date_time.tz != "+0330"
+        name: "{{ timezone_name }}"
+      become: true
+      tags: [timezone]
 
-    - name: install packages
-      apt:
-        pkg: [ 'tzdata' ]
-        state: latest
-        install_recommends: no
-        update_cache: yes
-      become: yes
-      when: ansible_date_time.tz != "+0330"
+    # ------------------------------------------------------------------ NTP ---
+    - name: NTP | Check clock synchronization status
+      ansible.builtin.command: timedatectl status
+      environment:
+        LC_ALL: C
+      register: ntp_status_before
+      changed_when: false
+      check_mode: false
+      tags: [ntp]
+
+    - name: NTP | Record whether the clock is synchronized
+      ansible.builtin.set_fact:
+        ntp_synced_before: "{{ ntp_status_before.stdout is search(ntp_synced_regex, multiline=True) }}"
+      tags: [ntp]
+
+    - name: NTP | Show synchronization status before changes
+      ansible.builtin.debug:
+        msg: "System clock synchronized: {{ 'yes' if ntp_synced_before else 'no' }}"
+      tags: [ntp]
+
+    - name: NTP | Configure systemd-timesyncd on hosts that are not synchronized
+      when: ntp_force | bool or not ntp_synced_before
+      tags: [ntp]
+      block:
+        - name: NTP | Read NTP servers from the control node
+          ansible.builtin.set_fact:
+            ntp_pools_content: "{{ lookup('ansible.builtin.file', ntp_pools_file) }}"
+
+        - name: NTP | Validate the NTP servers file
+          ansible.builtin.assert:
+            that:
+              - ntp_pools_content is search(ntp_file_section_regex, multiline=True)
+              - ntp_pools_content is search(ntp_file_servers_regex, multiline=True)
+            fail_msg: "{{ ntp_pools_file }} must contain a [Time] section header and a non-empty NTP= line."
+            quiet: true
+
+        - name: NTP | Gather service facts
+          ansible.builtin.service_facts:
+
+        - name: NTP | Ensure systemd-timesyncd is available
+          ansible.builtin.assert:
+            that:
+              - "'systemd-timesyncd.service' in ansible_facts.services"
+            fail_msg: >-
+              systemd-timesyncd.service is not installed on {{ inventory_hostname }}.
+              If chrony or ntpd manages time on this host, configure that service instead
+              (installing systemd-timesyncd would remove it).
+            quiet: true
+
+        # The marker is fixed on purpose: re-runs update this one block in place instead
+        # of appending duplicates, even if ntp_pools_file points to a different file.
+        - name: NTP | Append NTP servers to {{ ntp_timesyncd_conf }}
+          ansible.builtin.blockinfile:
+            path: "{{ ntp_timesyncd_conf }}"
+            block: "{{ ntp_pools_content }}"
+            marker: "# {mark} ANSIBLE MANAGED BLOCK: NTP servers"
+            insertafter: EOF
+            create: true
+            backup: true
+            owner: root
+            group: root
+            mode: "0644"
+          become: true
+
+        - name: NTP | Enable and restart systemd-timesyncd
+          ansible.builtin.systemd:
+            name: systemd-timesyncd
+            enabled: true
+            state: restarted
+          become: true
+
+        - name: NTP | Wait for the clock to synchronize
+          when: not ansible_check_mode
+          block:
+            - name: NTP | Poll timedatectl status until synchronized
+              ansible.builtin.command: timedatectl status
+              environment:
+                LC_ALL: C
+              register: ntp_status_wait
+              changed_when: false
+              until: ntp_status_wait.stdout is search(ntp_synced_regex, multiline=True)
+              retries: "{{ ntp_sync_retries | int }}"
+              delay: "{{ ntp_sync_delay | int }}"
+          rescue:
+            - name: NTP | Collect systemd-timesyncd logs for troubleshooting
+              ansible.builtin.command: journalctl -u systemd-timesyncd -n 25 --no-pager
+              register: ntp_journal
+              changed_when: false
+              failed_when: false
+              become: true
+
+            - name: NTP | Show systemd-timesyncd logs
+              ansible.builtin.debug:
+                var: ntp_journal.stdout_lines
+
+    - name: NTP | Check final clock synchronization status
+      ansible.builtin.command: timedatectl status
+      environment:
+        LC_ALL: C
+      register: ntp_status_after
+      changed_when: false
+      check_mode: false
+      tags: [ntp]
+
+    - name: NTP | Show final timedatectl status
+      ansible.builtin.debug:
+        var: ntp_status_after.stdout_lines
+      tags: [ntp]
+
+    - name: NTP | Assert the system clock is synchronized
+      ansible.builtin.assert:
+        that:
+          - ntp_status_after.stdout is search(ntp_synced_regex, multiline=True)
+        fail_msg: >-
+          System clock on {{ inventory_hostname }} is still not synchronized. Check that the
+          host can resolve the servers in {{ ntp_pools_file | basename }} and reach them on
+          UDP/123 (see the systemd-timesyncd logs above).
+        success_msg: "System clock on {{ inventory_hostname }} is synchronized."
+      when: not ansible_check_mode
+      tags: [ntp]
